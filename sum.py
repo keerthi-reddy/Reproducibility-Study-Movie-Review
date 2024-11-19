@@ -206,7 +206,7 @@ def evaluate_step(model,args,tokenizer, test=False):
             results = rouge.compute(predictions=predictions, references=references)
         for metric_name in metric_names:
             print(metric_name)
-            metric_val = input_ids.new_zeros(1) + results[metric_name].mid.fmeasure
+            metric_val = input_ids.new_zeros(1) + results[metric_name]
             if metric_name in metricsDict:
                 metricsDict[metric_name].append(metric_val)
             else:
@@ -233,7 +233,8 @@ def evaluate_step(model,args,tokenizer, test=False):
 
 def train_model(num_training_steps,model,optimizer,config,tokenizer,scaler):
     progress_bar = tqdm(range(num_training_steps))
-    completed_steps, step, bert_val_r1 = 0, 0, -1
+    completed_steps, step = 0, 0
+    best_val_r1 = -1
     print(device)
     for epoch in range(args.epochs):
         model.train()
@@ -288,7 +289,8 @@ def train_model(num_training_steps,model,optimizer,config,tokenizer,scaler):
 
 def resume_train_model(steps_completed,epochs_completed,optimized_steps,num_training_steps,model,optimizer,config,tokenizer,scaler):
     progress_bar = tqdm(range(steps_completed, num_training_steps))
-    completed_steps, step, best_val_r1= optimized_steps, steps_completed, -1
+    completed_steps, step = optimized_steps, steps_completed
+    best_val_r1 = -1
     print(device)
     for epoch in range(epochs_completed,args.epochs):
         model.train()
