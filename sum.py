@@ -15,6 +15,7 @@ import numpy as np
 from torch.cuda.amp import GradScaler
 from bert_score import score as bert_score_func
 import evaluate
+import warnings
 
 warnings.filterwarnings('always')
 
@@ -195,8 +196,8 @@ def evaluate_step(model,args,tokenizer, test=False):
         predictions = tokenizer.batch_decode(generated_ids.tolist(), skip_special_tokens=True)
         references = tokenizer.batch_decode(output_ids.tolist(), skip_special_tokens=True)
         if test:
-            all_predictions.extend(predictions)
-            all_references.extend(references)
+            all_predictions += predictions
+            all_references += references
         metric_names = ['rouge1', 'rouge2', 'rougeL', 'rougeLsum']
         if test:
             results = rouge.compute(predictions=predictions, references=references, use_stemmer=True)
@@ -204,6 +205,7 @@ def evaluate_step(model,args,tokenizer, test=False):
         else:
             results = rouge.compute(predictions=predictions, references=references)
         for metric_name in metric_names:
+            print(metric_name)
             metric_val = input_ids.new_zeros(1) + results[metric_name].mid.fmeasure
             if metric_name in metricsDict:
                 metricsDict[metric_name].append(metric_val)
@@ -239,9 +241,11 @@ def train_model(num_training_steps,model,optimizer,config,tokenizer,scaler):
         for batch in train_dataloader:
             input_ids = batch[0].to(device)
             output_ids = batch[1].to(device)
-            train_loss += (model(input_ids, attention_mask=(input_ids != tokenizer.pad_token_id), 
+            loss = model(input_ids, attention_mask=(input_ids != tokenizer.pad_token_id), 
                             global_attention_mask=set_global_attention_mask(input_ids,tokenizer,args),
-                            labels=output_ids, use_cache=False).loss / args.grad_accum).item() 
+                            labels=output_ids, use_cache=False).loss
+            train_loss += (loss / args.grad_accum).item()
+        
             if args.fp16:
                 scaler.scale(loss).backward()
             else:
@@ -292,9 +296,10 @@ def resume_train_model(steps_completed,epochs_completed,optimized_steps,num_trai
         for batch in train_dataloader:
             input_ids = batch[0].to(device)
             output_ids = batch[1].to(device)
-            train_loss += (model(input_ids, attention_mask=(input_ids != tokenizer.pad_token_id),
+            loss = model(input_ids, attention_mask=(input_ids != tokenizer.pad_token_id), 
                             global_attention_mask=set_global_attention_mask(input_ids,tokenizer,args),
-                            labels=output_ids, use_cache=False).loss / args.grad_accum).item() 
+                            labels=output_ids, use_cache=False).loss
+            train_loss += (loss / args.grad_accum).item()
             if args.fp16:
                 scaler.scale(loss).backward()
             else:
@@ -338,7 +343,7 @@ def resume_train_model(steps_completed,epochs_completed,optimized_steps,num_trai
 
 if __name__ == '__main__':
 
-    main_arg_parser = argparse.ArgumentParser(description="summarization")
+    parser = argparse.ArgumentParser(description="summarization")
     parser.add_argument("--epochs", type=int, default=40, help="Number of epochs")
     parser.add_argument("--num_workers", type=int, default=4, help="Number of data loader workers")
     parser.add_argument("--max_output_len", type=int, default=1024, help="maximum num of wordpieces in the summary")
@@ -386,20 +391,15 @@ if __name__ == '__main__':
     trainDataset = SummarizationDataset(tokenizer=tokenizer, split_name="train", args=args)
     valDataset = SummarizationDataset(tokenizer=tokenizer, split_name="val", args=args)
     testDataset = SummarizationDataset(tokenizer=tokenizer, split_name="test", args=args)
-    if split_name == "train":
-        is_train = True
-    else: 
-        is_train = False
-    dataset = {"train": trainDataset, "val": valDataset, "test": testDataset}
-    return DataLoader(
-        dataset[split_name],
-        batch_size=args.batch_size,
-        shuffle=is_train,
-        num_workers=args.num_workers,
-        collate_fn=SummarizationDataset.collate_fn
-    )
-    if split_name == "train":
-        is_train = True
+    train_dataloader = DataLoader(trainDataset, batch_size=args.batch_size, shuffle=True,
+                                  num_workers=args.num_workers,
+                                  collate_fn=SummarizationDataset.collate_fn)
+    validation_dataloader = DataLoader(valDataset, batch_size=args.batch_size, shuffle=False,
+                                       num_workers=args.num_workers,
+                                       collate_fn=SummarizationDataset.collate_fn)
+    test_dataloader = DataLoader(testDataset, batch_size=args.batch_size, shuffle=False,
+                                 num_workers=args.num_workers,
+                                 collate_fn=SummarizationDataset.collate_fn)
     num_training_steps = args.epochs * len(train_dataloader)
     scaler = GradScaler(enabled=args.fp16)
     optimizer = torch.optim.Adam(model.parameters(), lr=5e-5)
