@@ -1,21 +1,20 @@
-import argparse
-import os
-import pickle
-import datasets
-from torch.utils.data import DataLoader, Dataset
-from transformers import AutoTokenizer, AutoConfig, AutoModelForSeq2SeqLM, set_seed, get_linear_schedule_with_warmup
-from tqdm.auto import tqdm
-import logging
-import torch
-device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
 import tempfile
 import shutil
 import random
 import numpy as np
 from torch.cuda.amp import GradScaler
-from bert_score import score as bert_score_func
 import evaluate
 import warnings
+import argparse
+import os
+import pickle
+from torch.utils.data import DataLoader, Dataset
+from transformers import AutoTokenizer, AutoConfig, AutoModelForSeq2SeqLM, get_linear_schedule_with_warmup
+from tqdm.auto import tqdm
+import logging
+import torch
+device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+
 
 warnings.filterwarnings('always')
 
@@ -31,6 +30,10 @@ class SummarizationDataset(Dataset):
 
 
         self.model_name = args.model_name
+
+        if args.model_name == "google/pegasus-x":
+            self.max_input_len = min(args.max_input_len, 4096)  # Pegasus-X long document handling
+            self.max_output_len = min(args.max_output_len, 1024)
 
         self.tokenizer = tokenizer
         with open(self.file_path,"rb") as f:
@@ -51,6 +54,9 @@ class SummarizationDataset(Dataset):
 
         if self.model_name =="allenai/led-large-16384":
             output_ids = output_ids[1:]
+        if self.model_name == "google/pegasus-x":
+            output_ids = output_ids[1:]
+
         return torch.tensor(input_ids), torch.tensor(output_ids)
 
     @staticmethod
@@ -69,6 +75,14 @@ def set_global_attention_mask(input_ids,tokenizer,args):
         for token in special_tokens:
             token_id = tokenizer.convert_tokens_to_ids(token)
             global_attention_mask[(input_ids == token_id)] = 1
+
+    if args.model_name == "google/pegasus-x" and args.use_global_attn:
+        special_tokens = ['<s>', '</s>', '<pad>', 'INT', 'EXT']
+        for token in special_tokens:
+            token_id = tokenizer.convert_tokens_to_ids(token)
+            if token_id != tokenizer.pad_token_id:
+                global_attention_mask[(input_ids == token_id)] = 1
+
     return global_attention_mask
 
 
@@ -103,6 +117,10 @@ def load_model(args):
     if args.model_name=="allenai/led-large-16384":
         print("Setting bos token id to 0")
         config.forced_bos_token_id = 0
+    if args.model_name == "google/pegasus-x":
+        config.max_length = args.max_input_len  # Set max input length
+        config.decoder_start_token_id = tokenizer.convert_tokens_to_ids("<pad>")  # Set decoder start token
+        config.force_bos_token_to_be_generated = False  # Optional: control BOS token generation
     if args.grad_ckpt:
         config.gradient_checkpointing = True
         config.use_cache = False
@@ -112,6 +130,8 @@ def load_model(args):
     tokenizer = AutoTokenizer.from_pretrained(args.model_name, use_fast=True,
                                               cache_dir="./cache/huggingface_cache")
     if args.model_name == "allenai/led-large-16384":
+        model.resize_token_embeddings(len(tokenizer))
+    if args.model_name == "google/pegasus-x":
         model.resize_token_embeddings(len(tokenizer))
     return tokenizer,model,config
 
@@ -188,10 +208,24 @@ def evaluate_step(model,args,tokenizer, test=False):
     for batch in data_loader:
         input_ids = batch[0].to(device)
         output_ids = batch[1].to(device)
-        with torch.no_grad():
-            generated_ids = model.generate(input_ids=input_ids,
-                                           attention_mask=(input_ids != tokenizer.pad_token_id),
-                                           global_attention_mask=set_global_attention_mask(input_ids,tokenizer,args),
+        if args.model_name == "google/pegasus-x":
+            generation_kwargs = {
+                "max_length": args.max_output_len,
+                "num_beams": 4,
+                "early_stopping": True,
+                "no_repeat_ngram_size": 2,  
+                "length_penalty": 1.0
+            }
+            generated_ids = model.generate(
+                input_ids=input_ids,
+                attention_mask=(input_ids != tokenizer.pad_token_id),
+                **generation_kwargs
+            ) 
+        else:
+            with torch.no_grad():
+                generated_ids = model.generate(input_ids=input_ids,
+                                            attention_mask=(input_ids != tokenizer.pad_token_id),
+                                            global_attention_mask=set_global_attention_mask(input_ids,tokenizer,args),
                                            use_cache=True, max_length=args.max_output_len, num_beams=4)
         predictions = tokenizer.batch_decode(generated_ids.tolist(), skip_special_tokens=True)
         references = tokenizer.batch_decode(output_ids.tolist(), skip_special_tokens=True)
@@ -236,6 +270,13 @@ def train_model(num_training_steps,model,optimizer,config,tokenizer,scaler):
     completed_steps, step = 0, 0
     best_val_r1 = -1
     print(device)
+    if config.model_name == "google/pegasus-x":
+        optimizer = torch.optim.AdamW(
+            model.parameters(), 
+            lr=5e-5, 
+            weight_decay=args.weight_decay,
+            eps=1e-8
+        )
     for epoch in range(args.epochs):
         model.train()
         train_loss = 0.0
